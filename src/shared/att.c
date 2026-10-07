@@ -53,7 +53,8 @@ struct bt_att_chan {
 	bool in_req;			/* There's a pending incoming request */
 
 	uint8_t *buf;
-	uint16_t mtu;
+	uint16_t mtu;		/* Negotiated ATT MTU */
+	size_t rx_size;		/* Capacity of buf */
 };
 
 struct bt_att {
@@ -1082,9 +1083,22 @@ static bool can_read_data(struct io *io, void *user_data)
 	uint8_t *pdu;
 	ssize_t bytes_read;
 
-	bytes_read = read(chan->fd, chan->buf, chan->mtu);
+	/*
+	 * Read into a buffer large enough for a maximum-size PDU: a
+	 * SOCK_SEQPACKET read() whose buffer is smaller than the datagram
+	 * silently discards the tail. Some LE Audio devices size their ATT
+	 * responses against a larger MTU than the one they negotiated with
+	 * us (asymmetric MTU exchange), which corrupts e.g. Read-By-Type
+	 * responses and aborts characteristic discovery.
+	 */
+	bytes_read = read(chan->fd, chan->buf, chan->rx_size);
 	if (bytes_read < 0)
 		return false;
+
+	if (bytes_read > chan->mtu)
+		DBG(att, "(chan %p) received %zd byte PDU with a negotiated "
+				"MTU of %u, peer exceeded the MTU", chan,
+				bytes_read, chan->mtu);
 
 	VERBOSE(att, "(chan %p) ATT received: %zd", chan, bytes_read);
 
@@ -1269,7 +1283,13 @@ static struct bt_att_chan *bt_att_chan_new(int fd, uint8_t type)
 	if (chan->mtu < BT_ATT_DEFAULT_LE_MTU)
 		goto fail;
 
-	chan->buf = malloc(chan->mtu);
+	/*
+	 * The receive buffer must be able to hold a whole L2CAP SDU even when
+	 * the peer sizes its PDUs against a larger MTU than the negotiated one;
+	 * otherwise read() silently drops the tail on SOCK_SEQPACKET.
+	 */
+	chan->rx_size = MAX(chan->mtu, BT_ATT_MAX_LE_MTU);
+	chan->buf = malloc(chan->rx_size);
 	if (!chan->buf)
 		goto fail;
 
@@ -1465,14 +1485,19 @@ bool bt_att_set_mtu(struct bt_att *att, uint16_t mtu)
 	if (!chan)
 		return -ENOTCONN;
 
-	buf = malloc(mtu);
-	if (!buf)
-		return false;
+	/* Grow the receive buffer if needed, but never shrink it below what is
+	 * required to receive an oversized PDU. */
+	if (mtu > chan->rx_size) {
+		buf = malloc(mtu);
+		if (!buf)
+			return false;
 
-	free(chan->buf);
+		free(chan->buf);
+		chan->buf = buf;
+		chan->rx_size = mtu;
+	}
 
 	chan->mtu = mtu;
-	chan->buf = buf;
 
 	if (chan->mtu > att->mtu) {
 		att->mtu = chan->mtu;
