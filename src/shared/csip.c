@@ -89,6 +89,7 @@ struct bt_csip {
 	struct bt_att *att;
 
 	unsigned int idle_id;
+	unsigned int ready_id;
 	struct queue *ready_cbs;
 
 	bt_csip_debug_func_t debug_func;
@@ -119,6 +120,11 @@ void bt_csip_detach(struct bt_csip *csip)
 		return;
 
 	bt_gatt_client_idle_unregister(csip->client, csip->idle_id);
+
+	if (csip->ready_id) {
+		bt_gatt_client_ready_unregister(csip->client, csip->ready_id);
+		csip->ready_id = 0;
+	}
 
 	bt_gatt_client_unref(csip->client);
 	csip->client = NULL;
@@ -628,10 +634,40 @@ static void csip_idle(void *data)
 	csip_notify_ready(csip);
 }
 
-bool bt_csip_attach(struct bt_csip *csip, struct bt_gatt_client *client)
+static void csip_rescan(struct bt_csip *csip)
 {
+	struct bt_csis *csis = csip_get_csis(csip);
 	bt_uuid_t uuid;
 
+	/* CSIS already located, nothing to do */
+	if (csis && csis->service)
+		return;
+
+	DBG(csip, "rescan CSIS");
+
+	bt_uuid16_create(&uuid, CSIS_UUID);
+	gatt_db_foreach_service(csip->rdb->db, &uuid, foreach_csis_service,
+				csip);
+}
+
+static void csip_client_ready(bool success, uint8_t att_ecode, void *user_data)
+{
+	struct bt_csip *csip = user_data;
+
+	if (!success)
+		return;
+
+	/* The remote database may only be populated once the client is
+	 * ready, so rescan in case CSIS was not present when attach was
+	 * called (e.g. the profile was attached before service discovery
+	 * had completed). Without this the SIRK would never be read and
+	 * the device would never join the coordinated set.
+	 */
+	csip_rescan(csip);
+}
+
+bool bt_csip_attach(struct bt_csip *csip, struct bt_gatt_client *client)
+{
 	if (!sessions)
 		sessions = queue_new();
 
@@ -650,9 +686,14 @@ bool bt_csip_attach(struct bt_csip *csip, struct bt_gatt_client *client)
 	csip->idle_id = bt_gatt_client_idle_register(csip->client, csip_idle,
 								csip, NULL);
 
-	bt_uuid16_create(&uuid, CSIS_UUID);
-	gatt_db_foreach_service(csip->rdb->db, &uuid, foreach_csis_service,
-				csip);
+	csip->ready_id = bt_gatt_client_ready_register(csip->client,
+						csip_client_ready, csip, NULL);
+
+	csip_rescan(csip);
+
+	/* If the client is already ready the callback above will not be
+	 * invoked, but this initial rescan already covered that case.
+	 */
 
 	return true;
 }
