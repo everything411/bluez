@@ -2305,12 +2305,18 @@ bool btd_device_add_set(struct btd_device *device, bool encrypted,
 	struct btd_device_set *set;
 	struct sirk_info *sirk;
 
-	if (encrypted && !device->ltk)
-		return false;
-
+	/*
+	 * Always remember the SIRK: an encrypted SIRK can only be resolved
+	 * once the LTK is known, which may not be the case yet when this is
+	 * called (e.g. CSIP SIRK read before the bonding completes). Store it
+	 * and let device_set_ltk() resolve it later through add_set().
+	 */
 	sirk = device_add_sirk_info(device, encrypted, key, size, rank);
 	if (!sirk)
 		return false;
+
+	if (encrypted && !device->ltk)
+		return true;
 
 	set = btd_set_add_device(device, encrypted ? device->ltk->key : NULL,
 						key, size);
