@@ -22,7 +22,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#include <glib.h>
+#include <linux/rfkill.h>
 
 #include "bluetooth/bluetooth.h"
 #include "bluetooth/hci.h"
@@ -40,6 +40,19 @@
 #include "src/shared/tester.h"
 #include "src/shared/mgmt.h"
 #include "src/shared/queue.h"
+#include "src/shared/timeout.h"
+
+struct simult_discovery {
+	bool during_scan_disable;
+	bool started;
+	bool stopped;
+	bool scan_disabled;
+	bool hooks;
+	unsigned int discov_id;
+	unsigned int power_off_id;
+	unsigned int inquiry_id;
+	unsigned int restart_id;
+};
 
 struct test_data {
 	tester_data_func_t test_setup;
@@ -63,7 +76,10 @@ struct test_data {
 	struct queue *expect_hci_q;
 	int unmet_conditions;
 	int unmet_setup_conditions;
+	bool setup_settle;
+	unsigned int settle_id;
 	int sk;
+	struct simult_discovery simult;
 };
 
 static void print_debug(const char *str, void *user_data)
@@ -73,9 +89,42 @@ static void print_debug(const char *str, void *user_data)
 	tester_print("%s%s", prefix, str);
 }
 
+static void simult_discovery_cleanup(struct test_data *data)
+{
+	struct simult_discovery *simult = &data->simult;
+
+	if (simult->power_off_id)
+		timeout_remove(simult->power_off_id);
+
+	if (simult->inquiry_id)
+		timeout_remove(simult->inquiry_id);
+
+	if (simult->restart_id)
+		timeout_remove(simult->restart_id);
+
+	if (simult->discov_id)
+		mgmt_unregister(data->mgmt, simult->discov_id);
+
+	if (simult->hooks) {
+		hciemu_del_hook(data->hciemu, HCIEMU_HOOK_PRE_EVT,
+						BT_HCI_CMD_INQUIRY);
+		hciemu_del_hook(data->hciemu, HCIEMU_HOOK_PRE_CMD,
+					BT_HCI_CMD_LE_SET_SCAN_ENABLE);
+	}
+
+	memset(simult, 0, sizeof(*simult));
+}
+
 static void test_post_teardown(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
+
+	simult_discovery_cleanup(data);
+
+	if (data->settle_id) {
+		timeout_remove(data->settle_id);
+		data->settle_id = 0;
+	}
 
 	if (data->sk >= 0)
 		close(data->sk);
@@ -512,6 +561,50 @@ static void test_add_setup_condition(struct test_data *data)
 		     data->unmet_setup_conditions);
 }
 
+/* Time without HCI commands after which the controller is considered
+ * settled, see test_setup_settle().
+ */
+#define SETTLE_TIMEOUT	100
+
+static bool settle_timeout(void *user_data)
+{
+	struct test_data *data = user_data;
+
+	data->settle_id = 0;
+	hciemu_clear_central_post_command_hooks(data->hciemu);
+
+	tester_print("Controller settled");
+	tester_setup_complete();
+
+	return false;
+}
+
+static void settle_command(uint16_t opcode, const void *param,
+					uint8_t length, void *user_data)
+{
+	struct test_data *data = user_data;
+
+	if (data->settle_id)
+		timeout_remove(data->settle_id);
+
+	data->settle_id = timeout_add(SETTLE_TIMEOUT, settle_timeout, data,
+									NULL);
+}
+
+/* The kernel may still program the controller, e.g. its accept and
+ * resolving lists, after replying to the setup commands, so wait for the
+ * controller to be idle for a while, or a test may see the setup commands
+ * instead of its own.
+ */
+static void test_setup_settle(struct test_data *data)
+{
+	tester_print("Waiting for the controller to settle");
+
+	hciemu_add_central_post_command_hook(data->hciemu, settle_command,
+									data);
+	settle_command(0, NULL, 0, data);
+}
+
 static void test_setup_condition_complete(struct test_data *data)
 {
 	data->unmet_setup_conditions--;
@@ -521,6 +614,11 @@ static void test_setup_condition_complete(struct test_data *data)
 
 	if (data->unmet_setup_conditions > 0)
 		return;
+
+	if (data->setup_settle) {
+		test_setup_settle(data);
+		return;
+	}
 
 	tester_setup_complete();
 }
@@ -768,6 +866,13 @@ static const struct generic_data set_powered_on_invalid_index_test = {
 	.send_param = set_powered_on_param,
 	.send_len = sizeof(set_powered_on_param),
 	.expect_status = MGMT_STATUS_INVALID_INDEX,
+};
+
+static const struct generic_data set_powered_on_rfkill_test = {
+	.send_opcode = MGMT_OP_SET_POWERED,
+	.send_param = set_powered_on_param,
+	.send_len = sizeof(set_powered_on_param),
+	.expect_status = MGMT_STATUS_RFKILLED,
 };
 
 static uint16_t settings_powered_advertising_privacy[] = {
@@ -6537,6 +6642,51 @@ static void setup_bthost(void)
 		bthost_write_scan_enable(bthost, 0x03);
 }
 
+static int rfkill_block(uint16_t index)
+{
+	struct rfkill_event ev;
+	char path[64], name[16], hci[16];
+	ssize_t len;
+	int fd, name_fd, err;
+
+	snprintf(hci, sizeof(hci), "hci%u", index);
+
+	fd = open("/dev/rfkill", O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	/* Reading /dev/rfkill returns an add event for each rfkill device */
+	while (read(fd, &ev, RFKILL_EVENT_SIZE_V1) == RFKILL_EVENT_SIZE_V1) {
+		snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%u/name",
+								ev.idx);
+
+		name_fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (name_fd < 0)
+			continue;
+
+		len = read(name_fd, name, sizeof(name) - 1);
+		close(name_fd);
+		if (len <= 0)
+			continue;
+
+		name[len] = '\0';
+		name[strcspn(name, "\n")] = '\0';
+		if (strcmp(name, hci))
+			continue;
+
+		ev.op = RFKILL_OP_CHANGE;
+		ev.soft = 1;
+
+		len = write(fd, &ev, RFKILL_EVENT_SIZE_V1);
+		err = len == RFKILL_EVENT_SIZE_V1 ? 0 : -EIO;
+		close(fd);
+		return err;
+	}
+
+	close(fd);
+	return -ENODEV;
+}
+
 static void setup_pairing_acceptor(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
@@ -6580,6 +6730,18 @@ static void setup_powered_callback(uint8_t status, uint16_t length,
 	tester_print("Controller powered on");
 
 	setup_bthost();
+}
+
+/* Powered on as one of several setup commands, which completes once all
+ * of them are, not just the client setup started from here.
+ */
+static void setup_powered_condition_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	setup_powered_callback(status, length, param, user_data);
+
+	if (status == MGMT_STATUS_SUCCESS)
+		test_setup_condition_complete(tester_get_data());
 }
 
 static void setup_class(const void *test_data)
@@ -10625,6 +10787,178 @@ static const char load_irks_le_public_param_1[] = {
 	0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
 };
 
+static const uint8_t host_rpa_report_param[] = {
+	0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+	0x01,
+	0x00,
+};
+
+static const struct bt_hci_cmd_le_set_scan_parameters host_rpa_unfiltered = {
+	.filter_policy = 0x00,
+};
+
+static const struct bt_hci_cmd_le_set_scan_parameters host_rpa_filtered = {
+	.filter_policy = 0x01,
+};
+
+static int host_rpa_unfiltered_check(const void *param, uint16_t length)
+{
+	const struct bt_hci_cmd_le_set_scan_parameters *cp = param;
+
+	if (length != sizeof(*cp))
+		return -EINVAL;
+
+	return cp->type != 0x00 || cp->filter_policy != 0x00;
+}
+
+static int host_rpa_filtered_check(const void *param, uint16_t length)
+{
+	const struct bt_hci_cmd_le_set_scan_parameters *cp = param;
+
+	if (length != sizeof(*cp))
+		return -EINVAL;
+
+	return cp->type != 0x00 || cp->filter_policy != 0x01;
+}
+
+static const struct generic_data host_rpa_autoconnect = {
+	.setup_settings = settings_powered_le,
+	.setup_send_opcode = MGMT_OP_LOAD_IRKS,
+	.setup_send_param = load_irks_le_public_param_1,
+	.setup_send_len = sizeof(load_irks_le_public_param_1),
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = add_device_le_public_param_1,
+	.send_len = sizeof(add_device_le_public_param_1),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = add_device_le_public_param_1,
+	.expect_alt_ev_len = sizeof(add_device_le_public_param_1),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
+	.expect_hci_param = &host_rpa_unfiltered,
+	.expect_hci_len = sizeof(host_rpa_unfiltered),
+	.expect_hci_param_check_func = host_rpa_unfiltered_check,
+};
+
+static const struct generic_data host_rpa_report = {
+	.setup_settings = settings_powered_le,
+	.setup_send_opcode = MGMT_OP_LOAD_IRKS,
+	.setup_send_param = load_irks_le_public_param_1,
+	.setup_send_len = sizeof(load_irks_le_public_param_1),
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = host_rpa_report_param,
+	.send_len = sizeof(host_rpa_report_param),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = host_rpa_report_param,
+	.expect_alt_ev_len = sizeof(host_rpa_report_param),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
+	.expect_hci_param = &host_rpa_unfiltered,
+	.expect_hci_len = sizeof(host_rpa_unfiltered),
+	.expect_hci_param_check_func = host_rpa_unfiltered_check,
+};
+
+static const struct generic_data host_rpa_no_irk_autoconnect = {
+	.setup_settings = settings_powered_le,
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = add_device_le_public_param_1,
+	.send_len = sizeof(add_device_le_public_param_1),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = add_device_le_public_param_1,
+	.expect_alt_ev_len = sizeof(add_device_le_public_param_1),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
+	.expect_hci_param = &host_rpa_filtered,
+	.expect_hci_len = sizeof(host_rpa_filtered),
+	.expect_hci_param_check_func = host_rpa_filtered_check,
+};
+
+static const uint8_t ll_privacy_rpa_filtered[] = {
+	0x00,			/* Own Address Type */
+	0x01,			/* Filter Policy - Accept List */
+	0x05,			/* PHYs - 1M and Coded */
+	0x00,			/* Type - Passive */
+	0x60, 0x00,		/* Interval */
+	0x30, 0x00,		/* Window */
+	0x00,			/* Type - Passive */
+	0x60, 0x00,		/* Interval */
+	0x30, 0x00,		/* Window */
+};
+
+static int ll_privacy_rpa_filtered_check(const void *param, uint16_t length)
+{
+	const struct bt_hci_cmd_le_set_ext_scan_params *cp = param;
+	const struct bt_hci_le_scan_phy *phy = (void *) cp->data;
+
+	if (length != sizeof(ll_privacy_rpa_filtered))
+		return -EINVAL;
+
+	return cp->filter_policy != 0x01 || phy[0].type != 0x00 ||
+							phy[1].type != 0x00;
+}
+
+static const struct generic_data ll_privacy_rpa_autoconnect = {
+	.setup_settings = settings_powered_le,
+	.setup_send_opcode = MGMT_OP_LOAD_IRKS,
+	.setup_send_param = load_irks_le_public_param_1,
+	.setup_send_len = sizeof(load_irks_le_public_param_1),
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = add_device_le_public_param_1,
+	.send_len = sizeof(add_device_le_public_param_1),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = add_device_le_public_param_1,
+	.expect_alt_ev_len = sizeof(add_device_le_public_param_1),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_EXT_SCAN_PARAMS,
+	.expect_hci_param = ll_privacy_rpa_filtered,
+	.expect_hci_len = sizeof(ll_privacy_rpa_filtered),
+	.expect_hci_param_check_func = ll_privacy_rpa_filtered_check,
+};
+
+static const struct generic_data ll_privacy_rpa_report = {
+	.setup_settings = settings_powered_le,
+	.setup_send_opcode = MGMT_OP_LOAD_IRKS,
+	.setup_send_param = load_irks_le_public_param_1,
+	.setup_send_len = sizeof(load_irks_le_public_param_1),
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = host_rpa_report_param,
+	.send_len = sizeof(host_rpa_report_param),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = host_rpa_report_param,
+	.expect_alt_ev_len = sizeof(host_rpa_report_param),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_EXT_SCAN_PARAMS,
+	.expect_hci_param = ll_privacy_rpa_filtered,
+	.expect_hci_len = sizeof(ll_privacy_rpa_filtered),
+	.expect_hci_param_check_func = ll_privacy_rpa_filtered_check,
+};
+
+static const struct generic_data host_rpa_no_irk_report = {
+	.setup_settings = settings_powered_le,
+	.send_opcode = MGMT_OP_ADD_DEVICE,
+	.send_param = host_rpa_report_param,
+	.send_len = sizeof(host_rpa_report_param),
+	.expect_param = add_device_rsp_le_public,
+	.expect_len = sizeof(add_device_rsp_le_public),
+	.expect_status = MGMT_STATUS_SUCCESS,
+	.expect_alt_ev = MGMT_EV_DEVICE_ADDED,
+	.expect_alt_ev_param = host_rpa_report_param,
+	.expect_alt_ev_len = sizeof(host_rpa_report_param),
+	.expect_hci_command = BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
+	.expect_hci_param = &host_rpa_filtered,
+	.expect_hci_len = sizeof(host_rpa_filtered),
+	.expect_hci_param_check_func = host_rpa_filtered_check,
+};
+
 static const uint8_t add_device_le_public_param_2[] = {
 	0x11, 0x22, 0x33, 0x44, 0x55, 0x66,	/* BDADDR */
 	0x01,					/* Type - LE Public */
@@ -11312,6 +11646,8 @@ static void setup_add_device_callback(uint8_t status, uint16_t length,
 	}
 
 	tester_print("New Device is Added");
+
+	test_setup_condition_complete(tester_get_data());
 }
 
 static void setup_remove_device_callback(uint8_t status, uint16_t length,
@@ -11345,6 +11681,17 @@ static void setup_add_adv_callback(uint8_t status, uint16_t length,
 								rp->instance);
 }
 
+/* Last of several setup commands, see setup_powered_condition_callback() */
+static void setup_add_advertising_condition_callback(uint8_t status,
+					uint16_t length, const void *param,
+					void *user_data)
+{
+	setup_add_advertising_callback(status, length, param, user_data);
+
+	if (status == MGMT_STATUS_SUCCESS)
+		test_setup_condition_complete(tester_get_data());
+}
+
 static void setup_add_adv_callback_adv(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -11368,7 +11715,7 @@ static void setup_add_adv_callback_adv(uint8_t status, uint16_t length,
 
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 					sizeof(adv_param), adv_param,
-					setup_add_advertising_callback,
+				setup_add_advertising_condition_callback,
 					NULL, NULL);
 }
 
@@ -11377,17 +11724,22 @@ static void setup_ll_privacy_set_flags_1(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 
+	data->setup_settle = true;
+
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
 					sizeof(load_irks_le_public_param_1),
 					load_irks_le_public_param_1,
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Set Powered On */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
@@ -11403,12 +11755,16 @@ static void setup_set_device_flags_callback(uint8_t status, uint16_t length,
 	}
 
 	tester_print("Device Flags are set");
+
+	test_setup_condition_complete(tester_get_data());
 }
 
 static void setup_ll_privacy_add_2(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
+
+	data->setup_settle = true;
 
 	/* Add IRKs of Device1 and Device2 */
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
@@ -11417,16 +11773,20 @@ static void setup_ll_privacy_add_2(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Set Powered On */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11439,6 +11799,8 @@ static void setup_ll_privacy_set_flags_3(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 
+	data->setup_settle = true;
+
 	/* Add IRKs of Device1 and Device2 */
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
 					sizeof(load_irks_2_devices_param),
@@ -11446,17 +11808,21 @@ static void setup_ll_privacy_set_flags_3(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Set Powered On */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11464,6 +11830,7 @@ static void setup_ll_privacy_set_flags_3(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
@@ -11484,6 +11851,8 @@ static void setup_ll_privacy_3_devices(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 
+	data->setup_settle = true;
+
 	/* Add IRKs of 4 Devices */
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
 					sizeof(load_irks_4_devices_param),
@@ -11491,12 +11860,14 @@ static void setup_ll_privacy_3_devices(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11504,12 +11875,14 @@ static void setup_ll_privacy_3_devices(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
@@ -11517,27 +11890,33 @@ static void setup_ll_privacy_3_devices(const void *test_data)
 					NULL);
 
 	/* Add Device 3 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_3),
 					add_device_le_public_param_3,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 3 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_3),
 					set_device_flags_param_3,
 					setup_set_device_flags_callback, NULL,
 					NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 }
 
 static void setup_ll_privacy_set_flags_4(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
+
+	data->setup_settle = true;
 
 	hciemu_set_central_le_rl_len(data->hciemu, 4);
 
@@ -11548,12 +11927,14 @@ static void setup_ll_privacy_set_flags_4(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11561,12 +11942,14 @@ static void setup_ll_privacy_set_flags_4(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
@@ -11574,12 +11957,14 @@ static void setup_ll_privacy_set_flags_4(const void *test_data)
 					NULL);
 
 	/* Add Device 3 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_3),
 					add_device_le_public_param_3,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 3 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_3),
 					set_device_flags_param_3,
@@ -11587,20 +11972,25 @@ static void setup_ll_privacy_set_flags_4(const void *test_data)
 					NULL);
 
 	/* Add Device 4 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_4),
 					add_device_le_public_param_4,
 					setup_add_device_callback, NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 }
 
 static void setup_ll_privacy_add_3(const void *test_data)
 {
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
+
+	data->setup_settle = true;
 
 	hciemu_set_central_le_al_len(data->hciemu, 2);
 
@@ -11611,17 +12001,21 @@ static void setup_ll_privacy_add_3(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Set Powered On */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11629,12 +12023,14 @@ static void setup_ll_privacy_add_3(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
@@ -11649,9 +12045,13 @@ static void setup_ll_privacy_device2_discovry(const void *test_data)
 	unsigned char param[] = { 0x01 };
 	uint8_t disc_param[] = { 0x06 };
 
+	data->setup_settle = true;
+
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 	/* Load IRKs */
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
 					sizeof(load_irks_2_devices_param),
@@ -11659,11 +12059,13 @@ static void setup_ll_privacy_device2_discovry(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Load Device1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
@@ -11692,6 +12094,8 @@ static void setup_ll_privacy_add_4(const void *test_data)
 	unsigned char param[] = { 0x01 };
 	unsigned char adv_param[sizeof(*cp) + TESTER_ADD_ADV_DATA_LEN];
 
+	data->setup_settle = true;
+
 	cp = (struct mgmt_cp_add_advertising *) adv_param;
 	setup_add_adv_param(cp, 1);
 
@@ -11712,6 +12116,8 @@ static void setup_ll_privacy_set_flags_5(const void *test_data)
 	unsigned char param[] = { 0x01 };
 	unsigned char adv_param[sizeof(*cp) + TESTER_ADD_ADV_DATA_LEN];
 
+	data->setup_settle = true;
+
 	cp = (struct mgmt_cp_add_advertising *) adv_param;
 	setup_add_adv_param(cp, 1);
 
@@ -11727,11 +12133,13 @@ static void setup_ll_privacy_set_flags_5(const void *test_data)
 					NULL, NULL, NULL);
 
 	/* Add Advertising Instance */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 					sizeof(adv_param), adv_param,
 					setup_add_adv_callback_adv, NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
@@ -11744,6 +12152,8 @@ static void setup_ll_privacy_set_flags_6(const void *test_data)
 	struct mgmt_cp_add_advertising *cp;
 	unsigned char param[] = { 0x01 };
 	unsigned char adv_param[sizeof(*cp) + TESTER_ADD_ADV_DATA_LEN];
+
+	data->setup_settle = true;
 
 	cp = (struct mgmt_cp_add_advertising *) adv_param;
 	setup_add_adv_param(cp, 1);
@@ -11760,17 +12170,20 @@ static void setup_ll_privacy_set_flags_6(const void *test_data)
 					NULL, NULL, NULL);
 
 	/* Add Advertising Instance 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 					sizeof(adv_param), adv_param,
 					setup_add_adv_callback_adv, NULL, NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
@@ -11778,6 +12191,7 @@ static void setup_ll_privacy_set_flags_6(const void *test_data)
 					NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
@@ -11790,6 +12204,8 @@ static void setup_ll_privacy_adv_3_devices(const void *test_data)
 	struct mgmt_cp_add_advertising *cp;
 	unsigned char param[] = { 0x01 };
 	unsigned char adv_param[sizeof(*cp) + TESTER_ADD_ADV_DATA_LEN];
+
+	data->setup_settle = true;
 
 	cp = (struct mgmt_cp_add_advertising *) adv_param;
 	setup_add_adv_param(cp, 1);
@@ -11805,12 +12221,14 @@ static void setup_ll_privacy_adv_3_devices(const void *test_data)
 					setup_load_irks_callback, NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11818,12 +12236,14 @@ static void setup_ll_privacy_adv_3_devices(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
@@ -11831,21 +12251,25 @@ static void setup_ll_privacy_adv_3_devices(const void *test_data)
 					NULL);
 
 	/* Add Device 3 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_3),
 					add_device_le_public_param_3,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 3 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_3),
 					set_device_flags_param_3,
 					setup_set_device_flags_callback, NULL,
 					NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 }
 
 static void setup_ll_privacy_adv_1_device_2_advs(const void *test_data)
@@ -11854,6 +12278,8 @@ static void setup_ll_privacy_adv_1_device_2_advs(const void *test_data)
 	struct mgmt_cp_add_advertising *cp;
 	unsigned char param[] = { 0x01 };
 	unsigned char adv_param[sizeof(*cp) + TESTER_ADD_ADV_DATA_LEN];
+
+	data->setup_settle = true;
 
 	cp = (struct mgmt_cp_add_advertising *) adv_param;
 	setup_add_adv_param(cp, 1);
@@ -11869,12 +12295,14 @@ static void setup_ll_privacy_adv_1_device_2_advs(const void *test_data)
 					NULL, NULL, NULL);
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 1 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_1),
 					set_device_flags_param_1,
@@ -11882,18 +12310,21 @@ static void setup_ll_privacy_adv_1_device_2_advs(const void *test_data)
 					NULL);
 
 	/* Add Device 2 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_2),
 					add_device_le_public_param_2,
 					setup_add_device_callback, NULL, NULL);
 
 	/* Device 2 Flags */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_DEVICE_FLAGS, data->mgmt_index,
 					sizeof(set_device_flags_param_2),
 					set_device_flags_param_2,
 					setup_set_device_flags_callback, NULL,
 					NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 					sizeof(adv_param), adv_param,
 					setup_add_adv_callback_adv, NULL, NULL);
@@ -11919,6 +12350,7 @@ static void setup_add_2_advertisings(const void *test_data)
 					sizeof(param), param,
 					NULL, NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 						sizeof(adv_param), adv_param,
 						setup_add_adv_callback_adv,
@@ -11941,6 +12373,7 @@ static void setup_add_2_advertisings_no_power(const void *test_data)
 						sizeof(param), &param,
 						NULL, NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_ADVERTISING, data->mgmt_index,
 						sizeof(adv_param), adv_param,
 						setup_add_adv_callback_adv,
@@ -11952,6 +12385,8 @@ static void setup_ll_privacy_enable_powered(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 	struct bthost *bthost;
+
+	data->setup_settle = true;
 
 	bthost = hciemu_client_get_host(data->hciemu);
 	bthost_set_scan_params(bthost, 0x01, 0x00, 0x00);
@@ -11969,6 +12404,8 @@ static void setup_ll_privacy_add_adv(const void *test_data)
 	unsigned char param[] = { 0x01 };
 	unsigned char set_adv_param[] = { 0x02 };
 	struct bthost *bthost;
+
+	data->setup_settle = true;
 
 	/* Setup bthost to enable the scan */
 	bthost = hciemu_client_get_host(data->hciemu);
@@ -12002,15 +12439,20 @@ static void setup_ll_privacy_add_device(const void *test_data)
 	struct test_data *data = tester_get_data();
 	unsigned char param[] = { 0x01 };
 
+	data->setup_settle = true;
+
 	mgmt_send(data->mgmt, MGMT_OP_LOAD_IRKS, data->mgmt_index,
 					sizeof(load_irks_le_public_param_1),
 					load_irks_le_public_param_1,
 					setup_load_irks_callback, NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_le_public_param_1),
 					add_device_le_public_param_1,
@@ -12135,6 +12577,31 @@ static void test_command_generic(const void *test_data)
 	test_add_condition(data);
 }
 
+static void test_command_rfkill_blocked(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	int err;
+
+	tester_print("Blocking controller through rfkill");
+
+	err = rfkill_block(data->mgmt_index);
+	if (err == -ENOENT) {
+		/* Kernel built without rfkill support */
+		tester_warn("No /dev/rfkill, skipping test");
+		tester_test_abort();
+		return;
+	}
+
+	if (err < 0) {
+		tester_warn("Failed to block hci%u through rfkill: %s",
+					data->mgmt_index, strerror(-err));
+		tester_test_failed();
+		return;
+	}
+
+	test_command_generic(test_data);
+}
+
 static void global_adv_disable_hci_callback(uint16_t opcode,
 					const void *param, uint8_t length,
 					void *user_data)
@@ -12209,7 +12676,7 @@ static void test_remove_device(const void *test_data)
 static bool hook_delay_cmd(const void *data, uint16_t len, void *user_data)
 {
 	tester_print("Delaying emulator response...");
-	g_usleep(250000);
+	usleep(250000);
 	tester_print("Delaying emulator response... Done.");
 	return true;
 }
@@ -12239,6 +12706,352 @@ static void test_add_remove_device_nowait(const void *test_data)
 				sizeof(remove_device_param_2),
 				remove_device_param_2,
 				command_generic_callback, NULL, NULL);
+}
+
+/* Simultaneous discovery: with HCI_QUIRK_SIMULTANEOUS_DISCOVERY the BR/EDR
+ * inquiry and the LE scan run together and the kernel's LE scan timeout
+ * ends the discovery. The emulator's own Inquiry Complete is suppressed and
+ * the test sends it either one second into the discovery (inquiry first) or
+ * between LE Set Scan Enable (disable) and its Command Complete (during scan
+ * disable). Either way Discovering (disabled) has to be sent and a new Start
+ * Discovery has to succeed.
+ */
+static bool simult_inquiry_complete(struct test_data *data, const char *when)
+{
+	struct btdev *btdev = vhci_get_btdev(hciemu_get_vhci(data->hciemu));
+	struct bt_hci_evt_inquiry_complete ev;
+
+	tester_print("Sending Inquiry Complete %s", when);
+
+	ev.status = BT_HCI_ERR_SUCCESS;
+
+	if (btdev_send_event(btdev, BT_HCI_EVT_INQUIRY_COMPLETE, &ev,
+							sizeof(ev)) < 0) {
+		tester_warn("Unable to send Inquiry Complete");
+		tester_test_failed();
+		return false;
+	}
+
+	return true;
+}
+
+static bool simult_inquiry_complete_early(void *user_data)
+{
+	struct test_data *data = user_data;
+
+	data->simult.inquiry_id = 0;
+
+	simult_inquiry_complete(data, "before LE scan disable");
+
+	return false;
+}
+
+static void simult_restart_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct test_data *data = user_data;
+
+	tester_print("Start Discovery after the LE scan timeout: %s (0x%02x)",
+						mgmt_errstr(status), status);
+
+	if (!data->simult.stopped) {
+		tester_warn("No Discovering (disabled) event before restart");
+		tester_test_failed();
+		return;
+	}
+
+	if (status != MGMT_STATUS_SUCCESS) {
+		tester_test_failed();
+		return;
+	}
+
+	tester_test_passed();
+}
+
+static bool simult_restart(void *user_data)
+{
+	struct test_data *data = user_data;
+	struct simult_discovery *simult = &data->simult;
+
+	simult->restart_id = 0;
+
+	/* Only Discovering events received up to here count */
+	mgmt_unregister(data->mgmt, simult->discov_id);
+	simult->discov_id = 0;
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_START_DISCOVERY, data->mgmt_index,
+				sizeof(start_discovery_bredrle_param),
+				start_discovery_bredrle_param,
+				simult_restart_callback, data, NULL)) {
+		tester_warn("Unable to send Start Discovery");
+		tester_test_failed();
+	}
+
+	return false;
+}
+
+static bool simult_inquiry_hook(const void *data, uint16_t len,
+							void *user_data)
+{
+	/* Command Status has been sent; skip the emulator's inquiry timers
+	 * so that the only Inquiry Complete is the one the test sends.
+	 */
+	return false;
+}
+
+static bool simult_scan_enable_hook(const void *param, uint16_t len,
+							void *user_data)
+{
+	const struct bt_hci_cmd_le_set_scan_enable *cmd = param;
+	struct test_data *data = user_data;
+	struct simult_discovery *simult = &data->simult;
+
+	if (len < sizeof(*cmd) || cmd->enable || !simult->started ||
+							simult->scan_disabled)
+		return true;
+
+	simult->scan_disabled = true;
+
+	tester_print("LE Set Scan Enable (disable) received");
+
+	if (simult->during_scan_disable &&
+			!simult_inquiry_complete(data,
+						"before its Command Complete"))
+		return true;
+
+	simult->restart_id = timeout_add_seconds(1, simult_restart, data, NULL);
+	if (!simult->restart_id) {
+		tester_warn("Unable to add restart timeout");
+		tester_test_failed();
+	}
+
+	return true;
+}
+
+static void simult_discovering(uint16_t index, uint16_t length,
+					const void *param, void *user_data)
+{
+	const struct mgmt_ev_discovering *ev = param;
+	struct test_data *data = user_data;
+	struct simult_discovery *simult = &data->simult;
+
+	if (length != sizeof(*ev)) {
+		tester_warn("Incorrect discovering event length");
+		tester_test_failed();
+		return;
+	}
+
+	tester_print("Discovering: type 0x%02x %s", ev->type,
+				ev->discovering ? "enabled" : "disabled");
+
+	if (!ev->discovering) {
+		simult->stopped = true;
+		return;
+	}
+
+	if (simult->started)
+		return;
+
+	simult->started = true;
+
+	if (simult->during_scan_disable)
+		return;
+
+	simult->inquiry_id = timeout_add_seconds(1,
+					simult_inquiry_complete_early, data,
+					NULL);
+	if (!simult->inquiry_id) {
+		tester_warn("Unable to add Inquiry Complete timeout");
+		tester_test_failed();
+	}
+}
+
+static void simult_start_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	tester_print("Start Discovery: %s (0x%02x)", mgmt_errstr(status),
+									status);
+
+	if (status != MGMT_STATUS_SUCCESS)
+		tester_test_failed();
+}
+
+static void simult_quirk_power_on_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct test_data *data = user_data;
+	struct simult_discovery *simult = &data->simult;
+
+	if (status != MGMT_STATUS_SUCCESS) {
+		tester_warn("Power on with the quirk: %s (0x%02x)",
+						mgmt_errstr(status), status);
+		tester_test_failed();
+		return;
+	}
+
+	simult->hooks = true;
+
+	if (hciemu_add_hook(data->hciemu, HCIEMU_HOOK_PRE_EVT,
+					BT_HCI_CMD_INQUIRY,
+					simult_inquiry_hook, data) < 0 ||
+			hciemu_add_hook(data->hciemu, HCIEMU_HOOK_PRE_CMD,
+					BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+					simult_scan_enable_hook, data) < 0) {
+		tester_warn("Unable to add emulator hooks");
+		tester_test_failed();
+		return;
+	}
+
+	simult->discov_id = mgmt_register(data->mgmt, MGMT_EV_DISCOVERING,
+					data->mgmt_index, simult_discovering,
+					data, NULL);
+	if (!simult->discov_id) {
+		tester_warn("Unable to register for Discovering events");
+		tester_test_failed();
+		return;
+	}
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_START_DISCOVERY, data->mgmt_index,
+				sizeof(start_discovery_bredrle_param),
+				start_discovery_bredrle_param,
+				simult_start_callback, NULL, NULL)) {
+		tester_warn("Unable to send Start Discovery");
+		tester_test_failed();
+	}
+}
+
+static void test_simult_discovery(bool during_scan_disable)
+{
+	struct test_data *data = tester_get_data();
+	struct vhci *vhci = hciemu_get_vhci(data->hciemu);
+	uint8_t param = 0x01;
+	int err;
+
+	data->simult.during_scan_disable = during_scan_disable;
+
+	err = vhci_set_quirk_simultaneous_discovery(vhci, true);
+	if (err == -ENOENT || err == -EACCES || err == -EPERM) {
+		/* No debugfs, no access to it or no such entry */
+		tester_warn("Unable to set quirk_simultaneous_discovery: %s",
+							strerror(-err));
+		tester_test_abort();
+		return;
+	}
+
+	if (err) {
+		tester_warn("Unable to set quirk_simultaneous_discovery: %s",
+							strerror(-err));
+		tester_test_failed();
+		return;
+	}
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
+					sizeof(param), &param,
+					simult_quirk_power_on_callback, data,
+					NULL)) {
+		tester_warn("Unable to send Set Powered");
+		tester_test_failed();
+	}
+}
+
+static void test_simult_discovery_inquiry_first(const void *test_data)
+{
+	test_simult_discovery(false);
+}
+
+static void test_simult_discovery_during_scan_disable(const void *test_data)
+{
+	test_simult_discovery(true);
+}
+
+static bool simult_setup_status(const char *step, uint8_t status)
+{
+	if (status == MGMT_STATUS_SUCCESS)
+		return true;
+
+	tester_warn("%s: %s (0x%02x)", step, mgmt_errstr(status), status);
+	tester_setup_failed();
+
+	return false;
+}
+
+static void simult_power_off_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	if (!simult_setup_status("Power off", status))
+		return;
+
+	tester_setup_complete();
+}
+
+static bool simult_power_off(void *user_data)
+{
+	struct test_data *data = user_data;
+	uint8_t param = 0x00;
+
+	data->simult.power_off_id = 0;
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
+				sizeof(param), &param,
+				simult_power_off_callback, NULL, NULL)) {
+		tester_warn("Unable to send Set Powered");
+		tester_setup_failed();
+	}
+
+	return false;
+}
+
+static void simult_power_on_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct test_data *data = user_data;
+
+	if (!simult_setup_status("Power on", status))
+		return;
+
+	/* mgmt_set_powered_complete() sends the reply before it frees the
+	 * pending command, so an immediate Set Powered can be answered Busy.
+	 */
+	data->simult.power_off_id = timeout_add_seconds(1, simult_power_off,
+								data, NULL);
+	if (!data->simult.power_off_id) {
+		tester_warn("Unable to add power off timeout");
+		tester_setup_failed();
+	}
+}
+
+static void simult_le_callback(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct test_data *data = user_data;
+	uint8_t param_on = 0x01;
+
+	if (!simult_setup_status("Set LE", status))
+		return;
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
+					sizeof(param_on), &param_on,
+					simult_power_on_callback, data, NULL)) {
+		tester_warn("Unable to send Set Powered");
+		tester_setup_failed();
+	}
+}
+
+/* The quirk can only be written while the controller is down. Until it is
+ * powered on through mgmt it is up with auto-off pending and Set Powered
+ * (off) leaves it up, so power it on and off here.
+ */
+static void setup_simult_discovery(const void *test_data)
+{
+	struct test_data *data = tester_get_data();
+	uint8_t param = 0x01;
+
+	if (!mgmt_send(data->mgmt, MGMT_OP_SET_LE, data->mgmt_index,
+					sizeof(param), &param,
+					simult_le_callback, data, NULL)) {
+		tester_warn("Unable to send Set LE");
+		tester_setup_failed();
+	}
 }
 
 static void trigger_device_found(void *user_data)
@@ -13023,15 +13836,18 @@ static void setup_suspend_resume_success_3(const void *test_data)
 	unsigned char param[] = { 0x01 };
 
 	/* Add Device 1 */
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_ADD_DEVICE, data->mgmt_index,
 					sizeof(add_device_success_param_3),
 					add_device_success_param_3,
 					setup_add_device_callback,
 					NULL, NULL);
 
+	test_add_setup_condition(data);
 	mgmt_send(data->mgmt, MGMT_OP_SET_POWERED, data->mgmt_index,
 					sizeof(param), param,
-					setup_powered_callback, NULL, NULL);
+					setup_powered_condition_callback,
+					NULL, NULL);
 }
 
 static void test_suspend_resume_success_3(const void *test_data)
@@ -13513,6 +14329,9 @@ int main(int argc, char *argv[])
 	test_bredrle("Set powered on - Invalid index",
 				&set_powered_on_invalid_index_test,
 				NULL, test_command_generic);
+	test_bredrle("Set powered on - Blocked by rfkill",
+				&set_powered_on_rfkill_test,
+				NULL, test_command_rfkill_blocked);
 	test_le("Set powered on - Privacy and Advertising",
 				&set_powered_on_privacy_adv_test,
 				NULL, test_command_generic);
@@ -13870,6 +14689,13 @@ int main(int argc, char *argv[])
 	test_bredrle("Start Discovery - Power Off 1",
 				&start_discovery_valid_param_power_off_1,
 				NULL, test_command_generic);
+	/* Simultaneous discovery ends on the 10.24 s LE scan timeout */
+	test_bredrle_full("Start Discovery - Simultaneous Inquiry First",
+				NULL, setup_simult_discovery,
+				test_simult_discovery_inquiry_first, 20);
+	test_bredrle_full("Start Discovery - Simultaneous Inquiry Late",
+				NULL, setup_simult_discovery,
+				test_simult_discovery_during_scan_disable, 20);
 
 	test_bredrle("Stop Discovery - Success 1",
 				&stop_discovery_success_test_1,
@@ -15341,6 +16167,37 @@ int main(int argc, char *argv[])
 	test_bredrle50("Set Exp Feature - Unknown feature",
 				&set_exp_feat_unknown,
 				NULL, test_command_generic);
+
+	/* Bluetooth 4.0 has no controller-side address resolution. */
+	test_bredrle("Scan RPA - Auto-connect with IRK", &host_rpa_autoconnect,
+				setup_command_generic, test_command_generic);
+	test_bredrle("Scan RPA - Background report with IRK", &host_rpa_report,
+				setup_command_generic, test_command_generic);
+	test_bredrle("Scan RPA - Auto-connect without IRK",
+				&host_rpa_no_irk_autoconnect, NULL,
+							test_command_generic);
+	test_bredrle("Scan RPA - Background report without IRK",
+			&host_rpa_no_irk_report, NULL, test_command_generic);
+
+	/* LL Privacy
+	 * Setup: Enable LE, load IRK and Power On
+	 * Run: Add new device with auto-connect
+	 * Expect: Passive scanning uses the accept list since the controller
+	 *         resolves RPAs
+	 */
+	test_bredrle50("LL Privacy - Scan RPA - Auto-connect with IRK",
+				&ll_privacy_rpa_autoconnect,
+				setup_command_generic, test_command_generic);
+
+	/* LL Privacy
+	 * Setup: Enable LE, load IRK and Power On
+	 * Run: Add new device with background report
+	 * Expect: Passive scanning uses the accept list since the controller
+	 *         resolves RPAs
+	 */
+	test_bredrle50("LL Privacy - Scan RPA - Background report with IRK",
+				&ll_privacy_rpa_report,
+				setup_command_generic, test_command_generic);
 
 	/* LL Privacy
 	 * Setup: Enable LE and Power On

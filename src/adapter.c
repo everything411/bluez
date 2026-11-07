@@ -280,6 +280,8 @@ struct btd_adapter {
 	char *short_name;		/* controller short name */
 	uint32_t supported_settings;	/* controller supported settings */
 	uint32_t pending_settings;	/* pending controller settings */
+	uint32_t pending_values;	/* values of pending settings */
+	struct queue *pending_props;	/* requests waiting a pending setting */
 	uint32_t power_state;		/* the power state */
 	uint32_t current_settings;	/* current controller settings */
 
@@ -745,6 +747,44 @@ struct set_mode_data {
 	uint8_t value;
 };
 
+struct pending_prop {
+	uint32_t setting;
+	GDBusPendingPropertySet id;
+	uint8_t status;
+};
+
+static bool reply_pending_prop(const void *data, const void *match_data)
+{
+	const struct pending_prop *prop = data;
+	const struct pending_prop *done = match_data;
+
+	if (!(prop->setting & done->setting))
+		return false;
+
+	if (done->status == MGMT_STATUS_SUCCESS)
+		g_dbus_pending_property_success(prop->id);
+	else if (done->status == MGMT_STATUS_RFKILLED)
+		g_dbus_pending_property_error(prop->id,
+					ERROR_INTERFACE ".Blocked",
+					mgmt_errstr(done->status));
+	else
+		g_dbus_pending_property_error(prop->id,
+					ERROR_INTERFACE ".Failed",
+					mgmt_errstr(done->status));
+
+	return true;
+}
+
+/* Reply to the requests that waited for a pending setting change */
+static void reply_pending_props(struct btd_adapter *adapter,
+					uint32_t setting, uint8_t status)
+{
+	struct pending_prop done = { .setting = setting, .status = status };
+
+	queue_remove_all(adapter->pending_props, reply_pending_prop, &done,
+									free);
+}
+
 static void set_mode_complete(uint8_t status, uint16_t length,
 					const void *param, void *user_data)
 {
@@ -761,6 +801,7 @@ static void set_mode_complete(uint8_t status, uint16_t length,
 		if (status != MGMT_STATUS_RFKILLED &&
 		    data->setting & MGMT_SETTING_POWERED)
 			reset_power_state_target(adapter, data->value);
+		reply_pending_props(adapter, data->setting, status);
 		return;
 	}
 
@@ -770,6 +811,7 @@ static void set_mode_complete(uint8_t status, uint16_t length,
 	 * event handling functions here.
 	 */
 	new_settings_callback(adapter->dev_id, length, param, adapter);
+	reply_pending_props(adapter, data->setting, status);
 }
 
 static void remove_temporary_devices(struct btd_adapter *adapter)
@@ -783,6 +825,17 @@ static void remove_temporary_devices(struct btd_adapter *adapter)
 		if (device_is_temporary(dev))
 			btd_adapter_remove_device(adapter, dev);
 	}
+}
+
+static void set_pending(struct btd_adapter *adapter, uint32_t setting,
+							uint8_t value)
+{
+	adapter->pending_settings |= setting;
+
+	if (value)
+		adapter->pending_values |= setting;
+	else
+		adapter->pending_values &= ~setting;
 }
 
 static bool set_mode(struct btd_adapter *adapter, uint16_t opcode,
@@ -828,7 +881,7 @@ static bool set_mode(struct btd_adapter *adapter, uint16_t opcode,
 	if (mgmt_send(adapter->mgmt, opcode,
 				adapter->dev_id, sizeof(cp), &cp,
 				set_mode_complete, data, g_free) > 0) {
-		adapter->pending_settings |= setting;
+		set_pending(adapter, setting, mode);
 		return true;
 	}
 	g_free(data);
@@ -2146,6 +2199,18 @@ static void discovering_callback(uint16_t index, uint16_t length,
 	 * passive scanning attempt.
 	 */
 	if (!adapter->discovery_list) {
+		/*
+		 * Discovering is left set when stopping the discovery of the
+		 * last client failed, so clear it once the kernel reports the
+		 * discovery as stopped.
+		 */
+		if (!adapter->discovery_enable && adapter->discovering) {
+			adapter->discovering = false;
+			g_dbus_emit_property_changed(dbus_conn, adapter->path,
+							ADAPTER_INTERFACE,
+							"Discovering");
+		}
+
 		if (!adapter->connect_le)
 			trigger_passive_scanning(adapter);
 		return;
@@ -2193,6 +2258,14 @@ static void stop_discovery_complete(uint8_t status, uint16_t length,
 	struct discovery_client *client;
 
 	DBG("status 0x%02x", status);
+
+	/*
+	 * MGMT_STATUS_REJECTED is returned from kernel when no discovery is
+	 * active, e.g. because it ended or another mgmt client stopped it
+	 * just before this command, so treat it as stopped as well.
+	 */
+	if (status == MGMT_STATUS_REJECTED)
+		status = MGMT_STATUS_SUCCESS;
 
 	client = discovery_complete(adapter, status);
 	if (client)
@@ -3129,6 +3202,7 @@ static void property_set_mode_complete(uint8_t status, uint16_t length,
 		if (status != MGMT_STATUS_RFKILLED &&
 		    data->setting & MGMT_SETTING_POWERED)
 			reset_power_state_target(adapter, data->value);
+		reply_pending_props(adapter, data->setting, status);
 		return;
 	}
 
@@ -3140,6 +3214,7 @@ static void property_set_mode_complete(uint8_t status, uint16_t length,
 	 * event handling functions here.
 	 */
 	new_settings_callback(adapter->dev_id, length, param, adapter);
+	reply_pending_props(adapter, data->setting, status);
 }
 
 static void clear_discoverable(struct btd_adapter *adapter)
@@ -3179,9 +3254,23 @@ static void property_set_mode(struct btd_adapter *adapter, uint32_t setting,
 
 	dbus_message_iter_get_basic(value, &enable);
 
+	/* A pending change, e.g. bondable set when an agent registers,
+	 * already does what is requested if it sets the same value: reply
+	 * once it completed instead of sending the command again.
+	 */
 	if (adapter->pending_settings & setting) {
-		g_dbus_pending_property_error(id, ERROR_INTERFACE ".Busy",
-						NULL);
+		struct pending_prop *prop;
+
+		if (!!(adapter->pending_values & setting) != !!enable) {
+			g_dbus_pending_property_error(id,
+						ERROR_INTERFACE ".Busy", NULL);
+			return;
+		}
+
+		prop = new0(struct pending_prop, 1);
+		prop->setting = setting;
+		prop->id = id;
+		queue_push_tail(adapter->pending_props, prop);
 		return;
 	}
 
@@ -3269,7 +3358,7 @@ static void property_set_mode(struct btd_adapter *adapter, uint32_t setting,
 
 	if (mgmt_send(adapter->mgmt, opcode, adapter->dev_id, len, param,
 			property_set_mode_complete, data, g_free) > 0) {
-		adapter->pending_settings |= setting;
+		set_pending(adapter, setting, mode);
 		return;
 	}
 
@@ -6224,6 +6313,9 @@ static void adapter_free(gpointer user_data)
 
 	queue_destroy(adapter->exp_pending, cancel_exp_pending);
 
+	reply_pending_props(adapter, UINT32_MAX, MGMT_STATUS_FAILED);
+	queue_destroy(adapter->pending_props, NULL);
+
 	/*
 	 * Unregister all handlers for this specific index since
 	 * the adapter bound to them is no longer valid.
@@ -7291,6 +7383,7 @@ static struct btd_adapter *btd_adapter_new(uint16_t index)
 	adapter->auths = g_queue_new();
 	adapter->exps = queue_new();
 	adapter->exp_pending = queue_new();
+	adapter->pending_props = queue_new();
 
 	return btd_adapter_ref(adapter);
 }
@@ -7892,6 +7985,36 @@ struct agent *adapter_get_agent(struct btd_adapter *adapter)
 	return agent_get(NULL);
 }
 
+/* Whether the kernel has a BR/EDR link to the device: its disconnection
+ * may be processed after the device connected again, e.g. when bluetoothd
+ * was slow to process events.
+ */
+static bool link_connected(struct btd_adapter *adapter,
+				struct btd_device *device, uint8_t bdaddr_type)
+{
+	struct hci_conn_info_req *cr;
+	bool connected;
+	int dd;
+
+	if (bdaddr_type != BDADDR_BREDR)
+		return false;
+
+	dd = hci_open_dev(adapter->dev_id);
+	if (dd < 0)
+		return false;
+
+	cr = g_malloc0(sizeof(*cr) + sizeof(struct hci_conn_info));
+	bacpy(&cr->bdaddr, device_get_address(device));
+	cr->type = ACL_LINK;
+
+	connected = !ioctl(dd, HCIGETCONNINFO, cr);
+
+	g_free(cr);
+	hci_close_dev(dd);
+
+	return connected;
+}
+
 static void adapter_remove_connection(struct btd_adapter *adapter,
 						struct btd_device *device,
 						uint8_t bdaddr_type,
@@ -7912,7 +8035,9 @@ static void adapter_remove_connection(struct btd_adapter *adapter,
 
 	device_remove_connection(device, bdaddr_type, &remove_device, reason);
 
-	device_cancel_authentication(device, TRUE);
+	/* Requests of a link that connected meanwhile are not cancelled */
+	if (!link_connected(adapter, device, bdaddr_type))
+		device_cancel_authentication(device, TRUE);
 
 	/* If another bearer is still connected */
 	if (btd_device_bearer_is_connected(device))
@@ -8260,14 +8385,23 @@ int btd_cancel_authorization(guint id)
 int btd_adapter_restore_powered(struct btd_adapter *adapter)
 {
 	bool powered;
+	int blocked;
 
 	powered = btd_adapter_get_powered(adapter);
-	if (adapter->power_state == ADAPTER_POWER_STATE_OFF_BLOCKED &&
-	    rfkill_get_blocked(adapter->dev_id) == 0) {
-		adapter_set_power_state(adapter,
-					powered ?
-					ADAPTER_POWER_STATE_ON :
-					ADAPTER_POWER_STATE_OFF);
+	if (adapter->power_state == ADAPTER_POWER_STATE_OFF_BLOCKED) {
+		blocked = rfkill_get_blocked(adapter->dev_id);
+
+		/* Powering on can't succeed while blocked, the rfkill
+		 * unblock event calls this function again.
+		 */
+		if (blocked > 0)
+			return 0;
+
+		if (blocked == 0)
+			adapter_set_power_state(adapter,
+						powered ?
+						ADAPTER_POWER_STATE_ON :
+						ADAPTER_POWER_STATE_OFF);
 	}
 
 	if (powered)
@@ -8911,6 +9045,7 @@ static void dev_disconnected(struct btd_adapter *adapter,
 					uint8_t reason)
 {
 	struct btd_device *device;
+	bool reconnected = false;
 	char dst[18];
 
 	ba2str(&addr->bdaddr, dst);
@@ -8920,6 +9055,11 @@ static void dev_disconnected(struct btd_adapter *adapter,
 	device = btd_adapter_find_device(adapter, &addr->bdaddr, addr->type);
 	if (device) {
 		bool removed;
+
+		/* The device connected again before this was processed: its
+		 * pending requests belong to the new link.
+		 */
+		reconnected = link_connected(adapter, device, addr->type);
 
 		adapter_remove_connection(adapter, device, addr->type, reason,
 						&removed);
@@ -8934,7 +9074,7 @@ static void dev_disconnected(struct btd_adapter *adapter,
 	}
 
 	/* device could be still connected to different bearer */
-	if (!device || !btd_device_is_connected(device))
+	if (!reconnected && (!device || !btd_device_is_connected(device)))
 		bonding_attempt_complete(adapter, &addr->bdaddr, addr->type,
 						MGMT_STATUS_DISCONNECTED);
 }
@@ -9477,6 +9617,7 @@ static void conn_subrate_evt(uint16_t index, uint16_t length,
 	const struct mgmt_ev_conn_subrate *ev = param;
 	struct btd_adapter *adapter = user_data;
 	uint16_t interval, subrate, latency, cont_num, supv_timeout;
+	struct btd_device *device;
 	char dst[18];
 
 	if (length < sizeof(*ev)) {
@@ -9503,6 +9644,17 @@ static void conn_subrate_evt(uint16_t index, uint16_t length,
 		"cont_num 0x%04x timeout 0x%04x", adapter->dev_id, dst,
 		ev->addr.type, interval, subrate, latency, cont_num,
 		supv_timeout);
+
+	device = btd_adapter_find_device(adapter, &ev->addr.bdaddr,
+							ev->addr.type);
+	if (!device)
+		return;
+
+	/* The interval is in units of 0.125 ms and the supervision timeout
+	 * in units of 10 ms.
+	 */
+	device_set_le_conn_params(device, interval * 125, latency,
+					supv_timeout * 10, subrate);
 }
 
 int adapter_set_io_capability(struct btd_adapter *adapter,

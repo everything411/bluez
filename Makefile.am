@@ -89,7 +89,7 @@ pkginclude_HEADERS += $(lib_headers)
 lib_LTLIBRARIES += lib/libbluetooth.la
 
 lib_libbluetooth_la_SOURCES = $(lib_headers) $(lib_sources)
-lib_libbluetooth_la_LDFLAGS = $(AM_LDFLAGS) -version-info 22:16:19
+lib_libbluetooth_la_LDFLAGS = $(AM_LDFLAGS) -version-info 22:17:19
 endif
 
 noinst_LTLIBRARIES += lib/libbluetooth-internal.la
@@ -272,7 +272,8 @@ src_libshared_mainloop_la_SOURCES = $(shared_sources) \
 				src/shared/timeout-mainloop.c \
 				src/shared/mainloop.h src/shared/mainloop.c \
 				src/shared/mainloop-notify.h \
-				src/shared/mainloop-notify.c
+				src/shared/mainloop-notify.c \
+				src/shared/tester.c
 src_libshared_mainloop_la_LDFLAGS = $(AM_LDFLAGS)
 src_libshared_mainloop_la_CFLAGS = $(AM_CFLAGS)
 
@@ -494,11 +495,14 @@ EXTRA_DIST += SECURITY.md
 EXTRA_DIST += doc/assigned-numbers.rst doc/supported-features.txt \
 				doc/test-coverage.txt \
 				doc/test-runner.rst \
+				doc/btvirt.rst \
+				doc/virtio.rst \
 				doc/test-functional.rst \
 				doc/functional-testing.rst \
 				doc/functional-a2dp.rst \
 				doc/functional-avrcp.rst \
 				doc/functional-bap.rst \
+				doc/functional-bearer.rst \
 				doc/functional-hog.rst \
 				doc/functional-mpris-proxy.rst \
 				doc/functional-obex.rst \

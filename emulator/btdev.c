@@ -269,8 +269,6 @@ struct btdev {
 	uint32_t sync_train_timeout;
 	uint8_t  sync_train_service_data;
 
-	uint16_t le_ext_adv_type;
-
 	); /* reset_group */
 
 	/* Real time length of AL array */
@@ -478,7 +476,7 @@ static void send_cmd(struct btdev *btdev, uint8_t evt, uint16_t opcode,
 					const struct iovec *iov, int iovlen)
 {
 	struct bt_hci_evt_hdr hdr;
-	struct iovec iov2[2 + iovlen];
+	struct iovec *iov2 = newa(struct iovec, 2 + iovlen);
 	uint8_t pkt = BT_H4_EVT_PKT;
 	int i;
 
@@ -3773,29 +3771,6 @@ done:
 	return 0;
 }
 
-static uint16_t ext_legacy_adv_type(uint8_t type)
-{
-	switch (type) {
-	case 0x00:
-		/* Connectable undirected - ADV_IND" */
-		return 0x0013;
-	case 0x01:
-		/* Connectable directed - ADV_DIRECT_IND */
-		return 0x0015;
-	case 0x02:
-		/* Scannable undirected - ADV_SCAN_IND */
-		return 0x0012;
-	case 0x03:
-		/* Non connectable undirected - ADV_NONCONN_IND */
-		return 0x0010;
-	case 0x04:
-		/* Scan response - SCAN_RSP */
-		return 0x0012;
-	}
-
-	return 0x0000;
-}
-
 static int cmd_set_adv_params(struct btdev *dev, const void *data, uint8_t len)
 {
 	const struct bt_hci_cmd_le_set_adv_parameters *cmd = data;
@@ -3807,8 +3782,6 @@ static int cmd_set_adv_params(struct btdev *dev, const void *data, uint8_t len)
 	}
 
 	dev->le_adv_type = cmd->type;
-	/* Use Legacy PDU if the remote is using EXT Scan */
-	dev->le_ext_adv_type = ext_legacy_adv_type(cmd->type);
 	dev->le_adv_own_addr = cmd->own_addr_type;
 	dev->le_adv_direct_addr_type = cmd->direct_addr_type;
 	memcpy(dev->le_adv_direct_addr, cmd->direct_addr, 6);
@@ -5564,17 +5537,19 @@ static bool ext_adv_broadcast(void *user_data)
 
 		/* if scannable bit is set the send scan response */
 		if (ext_adv->type & 0x02) {
+			uint16_t rsp_type;
+
 			if (ext_adv->type == 0x13)
-				report_type = 0x1b;
+				rsp_type = 0x1b;
 			else if (ext_adv->type == 0x12)
-				report_type = 0x1a;
+				rsp_type = 0x1a;
 			else if (!(ext_adv->type & 0x10))
-				report_type &= 0x08;
+				rsp_type = report_type | 0x08;
 			else
 				continue;
 
 			send_ext_adv(btdev_list[i], btdev, ext_adv,
-							report_type, true);
+							rsp_type, true);
 		}
 	}
 
@@ -8069,6 +8044,7 @@ static int cmd_le_read_conn_interval(struct btdev *dev, const void *data,
 
 	memset(&pdu, 0, sizeof(pdu));
 	pdu.rsp.status = BT_HCI_ERR_SUCCESS;
+	pdu.rsp.min = 0x08;			/* 1.000 ms */
 	pdu.rsp.num_grps = 1;
 	pdu.grp.min = cpu_to_le16(0x0008);	/* 1.000 ms */
 	pdu.grp.max = cpu_to_le16(0x0c80);	/* 400.000 ms */
@@ -8449,6 +8425,8 @@ struct btdev *btdev_create(enum btdev_type type, uint16_t id)
 
 void btdev_destroy(struct btdev *btdev)
 {
+	int i;
+
 	if (!btdev)
 		return;
 
@@ -8462,6 +8440,9 @@ void btdev_destroy(struct btdev *btdev)
 	queue_destroy(btdev->le_ext_adv, le_ext_adv_free);
 	queue_destroy(btdev->le_per_adv, free);
 	queue_destroy(btdev->le_big, le_big_free);
+
+	for (i = 0; i < MAX_HOOK_ENTRIES; i++)
+		free(btdev->hook_list[i]);
 
 	free(btdev);
 }
@@ -9182,4 +9163,15 @@ int btdev_set_emu_opcode(struct btdev *btdev, uint16_t opcode)
 	default:
 		return -ENOTSUP;
 	}
+}
+
+int btdev_send_event(struct btdev *btdev, uint8_t event, const void *data,
+								uint8_t len)
+{
+	if (!btdev)
+		return -EINVAL;
+
+	send_event(btdev, event, data, len);
+
+	return 0;
 }

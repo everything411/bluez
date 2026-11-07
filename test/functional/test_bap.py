@@ -4,6 +4,7 @@
 Tests for BAP (LE Audio) using bluetoothctl in VM instances
 """
 
+import os
 import threading
 import time
 import warnings
@@ -35,6 +36,11 @@ ControllerMode = le
 """
 
 TRANSPORT_RE = r"Transport (/org/bluez/\S+/fd\d+)"
+
+# A transport is reported once created, and indented under the endpoint
+# SetConfiguration call once its local endpoint is configured with it,
+# which bluetoothctl requires to select or acquire it
+CONFIGURED = "\t"
 
 
 def dev_addr(host):
@@ -111,12 +117,20 @@ def pair_le(host0, ctl0, host1, ctl1, advertise=True, services=False):
         ctl1.send("advertise on\n")
         ctl1.expect("Advertising object registered")
 
-    ctl0.expect(f"Device {host1.bdaddr.upper()}")
-    ctl0.send(f"pair {host1.bdaddr.upper()}\n")
+    addr = host1.bdaddr.upper()
+
+    ctl0.expect(f"Device {addr}")
+
+    # A device bonded by an earlier test on the same hosts is rejected
+    # with AlreadyExists if paired again, so connect it instead
+    if is_bonded(ctl0, addr):
+        ctl0.send(f"connect {addr}\n")
+    else:
+        ctl0.send(f"pair {addr}\n")
 
     pending = [PAIRED]
     if services:
-        pending.append(f"Device {host1.bdaddr.upper()} ServicesResolved: yes")
+        pending.append(f"Device {addr} ServicesResolved: yes")
 
     pair_wait(ctl0, ctl1, pending)
 
@@ -152,6 +166,25 @@ def list_transports(ctl0, hosts):
             return transports
 
         transports[idx - 1] = m[0].decode("utf-8")
+
+
+def is_bonded(ctl0, addr):
+    """
+    Tell whether the given device is bonded already.
+
+    This is what pairing it is rejected for, which Paired does not
+    reflect until the services are resolved, so cmd_pair, which checks
+    Paired, can still end up pairing a bonded device.
+    """
+    ctl0.send(f"info {addr}\n")
+
+    # Tab indented: the [CHG] lines and the LE. and BREDR. ones are not
+    idx, m = ctl0.expect(
+        [r"\tBonded: (yes|no)", rf"Device {addr} not available"],
+        timeout=REPLY_TIMEOUT,
+    )
+
+    return idx == 0 and m[0] == b"yes"
 
 
 def remove_device(ctl0, host):
@@ -231,14 +264,15 @@ def unicast_hosts(hosts):
     yield host0, host1, initiator, acceptor
 
 
-def expect_transports(ctl):
+def expect_transports(ctl, configured=False):
     """
     The endpoint is configured for stereo, so one stream per location is
     created, each with its own CIS in the same CIG.
     """
-    _, m = ctl.expect(r"Transport (/org/bluez/\S+/fd0)")
+    prefix = CONFIGURED if configured else ""
+    _, m = ctl.expect(prefix + r"Transport (/org/bluez/\S+/fd0)")
     left = m[0].decode("utf-8")
-    _, m = ctl.expect(r"Transport (/org/bluez/\S+/fd1)")
+    _, m = ctl.expect(prefix + r"Transport (/org/bluez/\S+/fd1)")
     right = m[0].decode("utf-8")
 
     return left, right
@@ -264,7 +298,7 @@ def test_bap_unicast_transport_created(unicast_hosts):
 def test_bap_unicast_transport_acquire(unicast_hosts):
     host0, host1, initiator, acceptor = unicast_hosts
 
-    left, right = expect_transports(initiator)
+    left, right = expect_transports(initiator, configured=True)
 
     # The CIS are only created once every CIS of the CIG is ready, so
     # all the transports need to be acquired
@@ -280,6 +314,108 @@ def test_bap_unicast_transport_acquire(unicast_hosts):
             f"Transport {right} State: active",
         ],
     )
+
+
+def resume_transports(paths, delay):
+    """Wait for each operation on all CIS before starting the next one."""
+    bus = None
+    interfaces = []
+    fds = {}
+
+    @mainloop_wrap
+    def setup():
+        nonlocal bus, interfaces
+        bus = get_dbus(private=True)
+        interfaces = [
+            dbus.Interface(
+                bus.get_object("org.bluez", path, introspect=False),
+                "org.bluez.MediaTransport1",
+            )
+            for path in paths
+        ]
+
+    def operation(method):
+        done = threading.Event()
+        replies = []
+        errors = []
+
+        def finished(index, error=None, values=()):
+            replies.append(index)
+            if error is not None:
+                errors.append((paths[index], str(error)))
+            elif method == "Acquire" and tuple(type(value) for value in values) == (
+                dbus.types.UnixFd,
+                dbus.UInt16,
+                dbus.UInt16,
+            ):
+                fds[index] = values[0].take()
+            elif method == "Acquire" or values:
+                # Release has an empty reply: a late ready callback must not
+                # answer it with an Acquire payload. Dispose of any stray FDs.
+                for value in values:
+                    if isinstance(value, dbus.types.UnixFd):
+                        os.close(value.take())
+                errors.append((paths[index], f"invalid {method} reply"))
+            if len(replies) == len(paths):
+                done.set()
+
+        @mainloop_wrap
+        def submit():
+            for index, interface in enumerate(interfaces):
+                if method == "Release":
+                    os.close(fds.pop(index))
+                getattr(interface, method)(
+                    reply_handler=lambda *values, i=index: finished(i, values=values),
+                    error_handler=lambda error, i=index: finished(i, error=error),
+                    timeout=DEFAULT_TIMEOUT,
+                )
+
+        submit()
+        # Different transport paths may have requests in flight together, but
+        # wait for every reply before another operation uses any of them.
+        assert done.wait(DEFAULT_TIMEOUT + 1), f"{method} did not complete"
+        assert not errors, (method, errors)
+
+    @mainloop_wrap
+    def check_active():
+        objects = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager",
+        ).GetManagedObjects()
+        for path in paths:
+            assert objects[path]["org.bluez.MediaTransport1"]["State"] == "active"
+
+    @mainloop_wrap
+    def cleanup():
+        for fd in fds.values():
+            os.close(fd)
+        fds.clear()
+        if bus is not None:
+            bus.close()
+
+    try:
+        setup()
+        operation("Acquire")
+        check_active()
+        for _ in range(3):
+            # Acquire has completed on both paths before Release starts.
+            # Release also waits for both replies before the next Acquire.
+            operation("Release")
+            if delay:
+                time.sleep(delay)
+            operation("Acquire")
+            check_active()
+    finally:
+        cleanup()
+
+
+@unicast_host_config
+@pytest.mark.parametrize("delay", [0, 0.1, 1.0])
+def test_bap_unicast_transport_resume(unicast_hosts, delay):
+    host0, host1, initiator, acceptor = unicast_hosts
+    transports = expect_transports(initiator)
+    expect_transports(acceptor)
+    host0.call(resume_transports, transports, delay)
 
 
 def clear_remote_transports(remote):
@@ -447,6 +583,156 @@ def test_bap_unicast_reconfigure_metadata(unicast_hosts, metadata):
     )
 
 
+# The initiator runs in testing mode, so its transports can be
+# desynchronized and each direction enabled on its own
+duplex_host_config = host_config(
+    [
+        Bluetoothd(conf=BAP_CONF.replace("[General]\n", "[General]\nTesting = true\n")),
+        Pexpect(),
+    ],
+    [Bluetoothd(conf=BAP_CONF), Pexpect()],
+)
+
+
+def show_transport(ctl, path):
+    """
+    Properties transport.show reports for the given transport.
+
+    They are indented, unlike the [CHG] lines of other transports that
+    may be printed in between, and a command with a known output is
+    issued after it to tell when everything has been listed.
+    """
+    ctl.send(f"transport.show {path}\nversion\n")
+    ctl.expect(f"Transport {path}", timeout=REPLY_TIMEOUT)
+
+    # Up to the end of the line, or a line still being printed would
+    # match only in part
+    props = {}
+    while True:
+        idx, m = ctl.expect(
+            [r"Version \d", r"\t(UUID|State|Desynchronized): ([^\r\n]*)\r?\n"],
+            timeout=REPLY_TIMEOUT,
+        )
+        if idx == 0:
+            return props
+
+        props[m[0].decode("utf-8")] = m[1].decode("utf-8")
+
+
+def show_state(ctl, path):
+    return show_transport(ctl, path)["State"]
+
+
+@pytest.fixture
+def duplex_hosts(hosts):
+    """
+    Initiator (host0) and acceptor (host1) each with a local PAC Sink and
+    PAC Source endpoint for a single location, paired over LE, with a
+    stream configured for each direction over the same CIS.
+
+    On the initiator, the transport of the remote Sink ASE is under its
+    pac_sink endpoint and the one of the remote Source ASE under its
+    pac_source endpoint. On the acceptor, each transport carries the UUID
+    of the local PAC of its ASE.
+    """
+    host0, host1 = hosts
+
+    initiator = start_bluetoothctl(host0, "bap-duplex-lc3.bt")
+    acceptor = start_bluetoothctl(host1, "bap-duplex-lc3.bt")
+
+    pair_le(host0, initiator, host1, acceptor)
+
+    # bluetoothctl only acquires a transport its local endpoint was
+    # configured with
+    paths = [
+        m[0].decode("utf-8")
+        for m in expect_all(initiator, [CONFIGURED + TRANSPORT_RE] * 2)
+    ]
+    to_sink = next(path for path in paths if "/pac_sink" in path)
+    from_source = next(path for path in paths if "/pac_source" in path)
+
+    # Each transport is reported when created and again under the
+    # SetConfiguration call of its endpoint
+    paths = []
+    while len(paths) < 2:
+        path = expect_all(acceptor, [TRANSPORT_RE])[0][0].decode("utf-8")
+        if path not in paths:
+            paths.append(path)
+    uuids = {path: show_transport(acceptor, path)["UUID"] for path in paths}
+    by_uuid = {
+        uuid: path
+        for path in paths
+        for uuid in (PAC_SINK_UUID, PAC_SOURCE_UUID)
+        if uuid in uuids[path]
+    }
+    assert len(by_uuid) == 2, f"acceptor transports: {uuids}"
+    sink = by_uuid[PAC_SINK_UUID]
+    source = by_uuid[PAC_SOURCE_UUID]
+
+    yield initiator, acceptor, to_sink, from_source, sink, source
+
+
+def desync(initiator, to_sink, from_source):
+    """Desynchronizing a transport desynchronizes its links as well."""
+    initiator.send(f"transport.desync {to_sink} on\n")
+    expect_all(initiator, ["Desynchronize succeeded"])
+
+    for path in (to_sink, from_source):
+        desync = show_transport(initiator, path)["Desynchronized"]
+        assert desync == "yes", f"{path} Desynchronized: {desync}"
+
+
+@duplex_host_config
+def test_bap_unicast_desync(duplex_hosts):
+    initiator, acceptor, to_sink, from_source, sink, source = duplex_hosts
+
+    desync(initiator, to_sink, from_source)
+
+    # Acquiring one transport leaves its link alone
+    initiator.send(f"transport.acquire {from_source}\n")
+    expect_all(initiator, [ACQUIRED, f"Transport {from_source} State: active"])
+    assert show_state(initiator, to_sink) == "idle"
+
+    # The link is acquired on its own, over the CIS already established
+    initiator.send(f"transport.acquire {to_sink}\n")
+    expect_all(initiator, [ACQUIRED, f"Transport {to_sink} State: active"])
+
+
+@duplex_host_config
+def test_bap_unicast_duplex_enable_one(duplex_hosts):
+    initiator, acceptor, to_sink, from_source, sink, source = duplex_hosts
+
+    desync(initiator, to_sink, from_source)
+
+    # Enable the remote Source ASE only, leaving its Sink ASE in QoS,
+    # while the CIS they share is established. bluetoothctl on the
+    # acceptor acquires a transport as soon as it is pending, as an
+    # audio server would.
+    initiator.send(f"transport.acquire {from_source}\n")
+    expect_all(initiator, [ACQUIRED, f"Transport {from_source} State: active"])
+    expect_all(acceptor, [ACQUIRED, f"Transport {source} State: active"])
+
+    # The Sink ASE has not been enabled, so its transport must not be
+    # reported as pending, nor acquired along with the Source one
+    state = show_state(acceptor, sink)
+    assert state == "idle", f"{sink} {state} while in QoS"
+
+    # Once the initiator enables it, it is acquired on its own
+    initiator.send(f"transport.acquire {to_sink}\n")
+    expect_all(initiator, [ACQUIRED, f"Transport {to_sink} State: active"])
+    expect_all(acceptor, [ACQUIRED, f"Transport {sink} State: active"])
+
+    # Disabling the Sink ASE alone leaves the Source one streaming
+    initiator.send(f"transport.release {to_sink}\n")
+    expect_all(initiator, ["Release successful", f"Transport {to_sink} State: idle"])
+    expect_all(acceptor, [f"Transport {sink} State: idle"])
+    time.sleep(1)
+
+    for ctl, path in ((initiator, from_source), (acceptor, source)):
+        state = show_state(ctl, path)
+        assert state == "active", f"{path} {state} once the Sink ASE released"
+
+
 # Broadcast code used by the broadcast scripts, see BCAST_CODE in
 # client/player.c
 BCAST_CODE = (
@@ -497,7 +783,7 @@ def test_bap_broadcast_transport_created(hosts, source_script):
 def test_bap_broadcast_transport_acquire(hosts, source_script):
     source, sink = start_broadcast(hosts, source_script)
 
-    _, m = sink.expect(TRANSPORT_RE)
+    _, m = sink.expect(CONFIGURED + TRANSPORT_RE)
     transport = m[0].decode("utf-8")
 
     # Selecting the transport syncs to the BIG and starts acquiring it
@@ -552,7 +838,7 @@ def expect_bis_transport(ctl, host, bis):
     Transport a side created for the BIS carrying its own channel,
     checking it is the only one it has.
     """
-    _, m = ctl.expect(BIS_TRANSPORT.format(bis))
+    _, m = ctl.expect(CONFIGURED + BIS_TRANSPORT.format(bis))
     transport = m[0].decode("utf-8")
 
     # Checked over D-Bus rather than with transport.list, as the
@@ -812,8 +1098,8 @@ def set_hosts(hosts, secure_connections):
             "Pairing successful",
             f"DeviceSet /org/bluez/hci0/{SET_PATH}",
             f"Device {host2.bdaddr.upper()} Bonded: yes",
-            TRANSPORT.format(dev_addr(host1)),
-            TRANSPORT.format(dev_addr(host2)),
+            CONFIGURED + TRANSPORT.format(dev_addr(host1)),
+            CONFIGURED + TRANSPORT.format(dev_addr(host2)),
         ],
     )
 

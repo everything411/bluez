@@ -3875,6 +3875,11 @@ bool btd_device_bdaddr_type_seen(struct btd_device *dev, uint8_t type)
 	return get_state(dev, type)->last_seen != 0;
 }
 
+bool btd_device_bdaddr_type_initiator(struct btd_device *dev, uint8_t type)
+{
+	return get_state(dev, type)->initiator;
+}
+
 static void clear_temporary_timer(struct btd_device *dev)
 {
 	if (dev->temporary_timer) {
@@ -5457,9 +5462,26 @@ void device_merge_duplicate(struct btd_device *dev, struct btd_device *dup)
 {
 	GSList *l;
 
-	DBG("");
+	DBG("dev path '%s', dup dev path '%s'", dev->path, dup->path);
 
-	dev->bredr = dup->bredr;
+	/* dup keeps its own bearer, which is destroyed along with it, so
+	 * dev needs a bearer of its own unless it already has one.
+	 */
+	if (!dev->bredr)
+		dev->bredr = btd_bearer_new(dev, BDADDR_BREDR);
+
+	/* Connection state stays with dup, which owns the link and gets
+	 * its disconnection, so only the pairing state is inherited.
+	 */
+	if (dup->bredr_state.paired && !dev->bredr_state.paired) {
+		dev->bredr_state.paired = true;
+		btd_bearer_paired(dev->bredr);
+	}
+
+	if (dup->bredr_state.bonded && !dev->bredr_state.bonded) {
+		dev->bredr_state.bonded = true;
+		btd_bearer_bonded(dev->bredr);
+	}
 
 	dev->trusted = dup->trusted;
 	dev->blocked = dup->blocked;
@@ -6531,6 +6553,8 @@ static void gatt_server_init(struct btd_device *device,
 		bt_gatt_server_set_permissions(device->server, false);
 
 	bt_gatt_server_set_debug(device->server, gatt_debug, NULL, NULL);
+	bt_gatt_server_set_mnotify_timeout(device->server,
+						btd_opts.gatt_mnotify);
 
 	btd_gatt_database_server_connected(database, device->server);
 }
@@ -6781,8 +6805,11 @@ static void att_connect_cb(GIOChannel *io, GError *gerr, gpointer user_data)
 		goto done;
 	}
 
-	/* Update connected state */
-	device->le_state.connected = true;
+	/* Update connected state in case the MGMT Device Connected event has
+	 * not been processed yet, the connection was locally initiated.
+	 */
+	if (!device->le_state.connected)
+		device_add_connection(device, device->bdaddr_type, BIT(3));
 
 	if (!device_attach_att(device, io))
 		goto done;
@@ -8502,6 +8529,14 @@ void btd_device_set_conn_param(struct btd_device *device, uint16_t min_interval,
 					device->bdaddr_type, min_interval,
 					max_interval, latency,
 					timeout);
+}
+
+void device_set_le_conn_params(struct btd_device *device, uint32_t interval,
+				uint16_t latency, uint16_t supv_timeout,
+				uint16_t subrate)
+{
+	btd_bearer_conn_params(device->le, interval, latency, supv_timeout,
+								subrate);
 }
 
 void btd_device_foreach_service_data(struct btd_device *dev, bt_ad_func_t func,
